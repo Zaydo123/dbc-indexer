@@ -1,0 +1,11 @@
+# Project dependencies
+# Local fork of anchorpy (installed editable from third_party)
+-e ./third_party/anchorpy
+
+# Direct runtime deps used in main.py and generated code
+grpcio>=1.59
+protobuf>=4.24
+base58>=2.1.1
+solders>=0.21.0
+typing_extensions>=4.8.0
+python-dotenv>=1.1.1
