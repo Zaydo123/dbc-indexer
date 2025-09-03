@@ -1,6 +1,6 @@
 # Project dependencies
 # Local fork of anchorpy (installed editable from third_party)
--e ./third_party/anchorpy
+-e ../third_party/anchorpy
 
 # Direct runtime deps used in main.py and generated code
 grpcio>=1.59

@@ -1,0 +1,40 @@
+version: "3.9"
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: grpc_timescaledb
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=grpc
+      - TIMESCALEDB_TELEMETRY=off
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+      - timescale_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+  db-migrator:
+    image: postgres:15
+    container_name: grpc_db_migrator
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    environment:
+      - DB_HOST=timescaledb
+      - DB_PORT=5432
+      - DB_NAME=grpc
+      - DB_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    volumes:
+      - ./:/workspace:ro
+    working_dir: /workspace
+    entrypoint: ["/bin/bash", "-c", "chmod +x db/scripts/migrate.sh && db/scripts/migrate.sh"]
+    restart: "no"
+volumes:
+  timescale_data:

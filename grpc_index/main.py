@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from dotenv import load_dotenv
 load_dotenv()
 
-import base58
 import grpc
 from solders.pubkey import Pubkey
 from solders.signature import Signature
@@ -21,9 +20,15 @@ from solders.signature import Signature
 from anchorpy import Idl, InstructionCoder
 
 sys.path.append(os.path.join(os.path.dirname(__file__), 'generated'))
+# Ensure project root is importable to reach sibling package `common/`
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
+from common import from_geyser, parse_swap_normalized  # type: ignore
 from generated import geyser_pb2_grpc
 from generated import geyser_pb2
 from grpc import aio
+from ingestion.db import get_db_writer, TradeRow  # type: ignore
 
 @dataclass
 class Swap:
@@ -96,127 +101,42 @@ def create_subscription_request(mint: str, failed: bool, commitment: str):
 	return request
 
 async def parse_swap(mint: Pubkey, update: geyser_pb2.SubscribeUpdate):
-	if not update.transaction:
-		return None
-	else:
-		slot_landed = update.transaction.slot
-		try:
-			tx_sig = Signature.from_bytes(update.transaction.transaction.signature)
-		except Exception:
-			return None
-		account_keys = update.transaction.transaction.transaction.message.account_keys
-		# Fee payer is the first signer; in Solana messages it's the first account key.
-		fee_payer_pk = str(Pubkey.from_bytes(account_keys[0])) if account_keys else None
-		meta = update.transaction.transaction.meta
+    ntx = from_geyser(update)
+    if not ntx:
+        return None
+    return parse_swap_normalized(mint, ntx)
 
-		# Convert update.created_at (protobuf Timestamp) to RFC3339
-		received_at = None
-		try:
-			if hasattr(update, "created_at") and update.created_at:
-				dt = update.created_at.ToDatetime(tzinfo=datetime.timezone.utc)
-				received_at = dt.timestamp()
-		except Exception:
-			pass
-
-		# Build lookup for token balances by account_index
-		pre_tb = {tb.account_index: tb for tb in getattr(meta, "pre_token_balances", [])}
-		post_tb = {tb.account_index: tb for tb in getattr(meta, "post_token_balances", [])}
-
-		def _balance_for_idx(idx: int):
-			pre = pre_tb.get(idx)
-			post = post_tb.get(idx)
-			return pre, post
-
-		def _ui_amount(tb) -> Decimal:
-			return _token_amount_to_decimal(tb.ui_token_amount) if tb else Decimal(0)
-
-		for instruction in update.transaction.transaction.transaction.message.instructions:
-			if Pubkey.from_bytes(account_keys[instruction.program_id_index]) != DBC_PROGRAM_PK:
-				continue
-			parsed_ix = instruction_coder.parse(instruction.data)
-			ix_name = parsed_ix.name
-			if ix_name not in ("swap", "swap2"):
-				continue
-
-			# Map instruction account indices -> names using IDL order
-			acc_indices = list(instruction.accounts)
-			order = SWAP_ACCOUNTS_ORDER if ix_name == "swap" else SWAP2_ACCOUNTS_ORDER
-			name_to_index = {}
-			for i, name in enumerate(order):
-				if i < len(acc_indices):
-					name_to_index[name] = acc_indices[i]
-
-			input_idx = name_to_index.get("input_token_account")
-			output_idx = name_to_index.get("output_token_account")
-			base_mint_idx = name_to_index.get("base_mint")
-			quote_mint_idx = name_to_index.get("quote_mint")
-			payer_idx = name_to_index.get("payer")
-			payer_pk = (
-				str(Pubkey.from_bytes(account_keys[payer_idx]))
-				if (payer_idx is not None and payer_idx < len(account_keys))
-				else None
-			)
-
-			# Resolve the tracked mint as str for comparisons against balance entries
-			tracked_mint_str = str(mint)
-
-			def _delta_for_account(idx: int) -> Decimal:
-				pre, post = _balance_for_idx(idx)
-				if not pre and not post:
-					return Decimal(0)
-				# Only consider entries matching the tracked mint if present
-				pre_amt = _ui_amount(pre) if (pre and pre.mint == tracked_mint_str) else Decimal(0)
-				post_amt = _ui_amount(post) if (post and post.mint == tracked_mint_str) else Decimal(0)
-				return post_amt - pre_amt
-
-			direction = None
-			amt_change: Decimal = Decimal(0)
-			if input_idx is not None:
-				amt_change += _delta_for_account(input_idx)
-			if output_idx is not None:
-				amt_change += _delta_for_account(output_idx)
-
-			if amt_change > 0:
-				direction = "BUY"
-			elif amt_change < 0:
-				direction = "SELL"
-
-			# Determine decimals for the tracked mint if present in token balances
-			tracked_decimals = None
-			for tb in list(pre_tb.values()) + list(post_tb.values()):
-				if tb.mint == tracked_mint_str and hasattr(tb, "ui_token_amount"):
-					uta = tb.ui_token_amount
-					if hasattr(uta, "decimals"):
-						tracked_decimals = int(uta.decimals)
-						break
-
-			try:
-				params = parsed_ix.data.params
-			except Exception:
-				params = parsed_ix.data
-
-			return Swap(
-				signature=str(tx_sig),
-				ix_name=ix_name,
-				slot_landed=slot_landed,
-				received_at=received_at,
-				fee_payer=fee_payer_pk,
-				payer=payer_pk,
-				base_mint=str(Pubkey.from_bytes(account_keys[base_mint_idx])),
-				quote_mint=str(Pubkey.from_bytes(account_keys[quote_mint_idx])),
-				amount_in=getattr(params, "amount_in", getattr(params, "amount_0", None)),
-				min_out_or_amount1=getattr(params, "minimum_amount_out", getattr(params, "amount_1", None)),
-				swap_mode=getattr(params, "swap_mode", None),
-				direction_for_tracked_mint=direction,
-				tracked_mint_decimals=tracked_decimals,
-				delta_tracked=float(amt_change),
-			)
+def _serialize_tb_list(seq):
+    out = []
+    if not seq:
+        return out
+    for tb in seq:
+        if isinstance(tb, dict):
+            out.append(tb)
+        else:
+            try:
+                uta = getattr(tb, "ui_token_amount", None)
+                out.append({
+                    "accountIndex": getattr(tb, "account_index", None),
+                    "mint": getattr(tb, "mint", None),
+                    "owner": getattr(tb, "owner", None),
+                    "uiTokenAmount": {
+                        "uiAmountString": str(getattr(uta, "ui_amount_string", None)) if getattr(uta, "ui_amount_string", None) is not None else None,
+                        "amount": getattr(uta, "amount", None),
+                        "decimals": getattr(uta, "decimals", None),
+                    } if uta is not None else None,
+                })
+            except Exception:
+                # Best-effort: skip malformed entries
+                pass
+    return out
 
 async def listen(endpoint: str, mint: str, output: str, logger: logging.Logger, stop: asyncio.Event):
 	counter = 0
 	start_time = time.time()
 	logger.info("Listening for transactions... endpoint=%s mint=%s", endpoint, mint)
 	mint_pk = Pubkey.from_string(mint)
+	writer = await get_db_writer()
 
 	async with aio.insecure_channel(endpoint) as channel:
 		stub = geyser_pb2_grpc.GeyserStub(channel)
@@ -235,7 +155,43 @@ async def listen(endpoint: str, mint: str, output: str, logger: logging.Logger, 
 			counter += 1
 			parsed = await parse_swap(mint_pk, update)
 			if parsed:
-				logger.info(parsed.__dict__)
+				logger.info(json.dumps(parsed, indent=4))
+				# Enqueue to DB ingestion
+				try:
+					ntx = from_geyser(update)
+					if ntx:
+						base_mint = parsed.get("base_mint")
+						quote_mint = parsed.get("quote_mint")
+						price = parsed.get("price")
+						d_base = parsed.get("delta_base")
+						d_quote = parsed.get("delta_quote")
+						# Enforce NOT NULL constraints for price/amounts
+						if base_mint and quote_mint and price is not None and d_base is not None and d_quote is not None:
+							ts = parsed.get("received_at")
+							if not ts and getattr(ntx, "received_at", None):
+								try:
+									ts = int(ntx.received_at.timestamp())
+								except Exception:
+									ts = None
+							ts = float(ts or time.time())
+							trow = TradeRow(
+								time=ts,
+								base_mint=str(base_mint),
+								quote_mint=str(quote_mint),
+								side=int(parsed.get("side")) if parsed.get("side") is not None else None,
+								price=float(price),
+								amount_base=abs(float(d_base)),
+								amount_quote=abs(float(d_quote)),
+								tx_sig=str(parsed.get("signature")),
+								slot=int(parsed.get("slot_landed") or 0),
+								meta={
+									"preTokenBalances": _serialize_tb_list(getattr(ntx.meta, "pre_token_balances", None)),
+									"postTokenBalances": _serialize_tb_list(getattr(ntx.meta, "post_token_balances", None)),
+								},
+							)
+							await writer.enqueue_trade(trow)
+				except Exception as e:
+					logger.debug("ingestion enqueue error: %s", e)
 
 async def _run_with_retries(args):
 	logger = logging.getLogger("swap_parser")
@@ -289,7 +245,6 @@ def _configure_logging(level: str):
 		level=getattr(logging, level.upper(), logging.INFO),
 		format="%(asctime)s %(levelname)s %(message)s",
 	)
-
 
 def main():
 	parser = _build_arg_parser()
